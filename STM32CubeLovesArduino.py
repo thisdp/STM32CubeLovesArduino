@@ -131,37 +131,30 @@ def create_arduino_it(folder: Path, it_handlers: dict):
 
     # 读取已有文件，提取已存在的函数名（包括活跃和废弃的）
     existing = {}  # 函数名 → 代码块
+    deprecated_names = set()
     if path.exists():
         with open(path, "r", encoding=ENCODING) as f:
             old_content = f.read()
-        # 活跃函数: extern "C" void FuncName(
+        deprecated_names = _extract_deprecated_names(old_content)
+        # 活跃函数: extern "C" void FuncName(（排除废弃函数名，否则会误匹配到 // 注释行）
         for name in re.findall(r'extern\s+"C"\s+void\s+(\w+)\s*\(', old_content):
-            _extract_func_block(old_content, name, existing)
+            if name not in deprecated_names:
+                _extract_func_block(old_content, name, existing)
         # 废弃函数: // extern "C" void FuncName(  // --deprecated
-        for name in re.findall(r'//\s*extern\s+"C"\s+void\s+(\w+)\s*\(', old_content):
-            if name not in existing:
-                _extract_func_block(old_content, name, existing, deprecated=True)
+        for name in deprecated_names:
+            _extract_func_block(old_content, name, existing, deprecated=True)
 
-    # 合并：it.c 中存在的函数 → 保留旧 body（含用户修改）；不存在的保留旧 body
+    # 合并：保留旧 body（含用户修改）。废弃函数统一先去掉 // 前缀还原为
+    # 活跃形式，写入阶段再按函数是否存在于 it.c 决定是否重新注释，保证幂等
     new_count = 0
     restored_count = 0
     merged = {}
     for name, body in existing.items():
-        if name in it_handlers:
-            # 函数重新出现在 it.c 中 → 保留用户的旧 body（去掉 // 注释前缀）
-            if name in _extract_deprecated_names(old_content) if path.exists() else set():
-                restored_count += 1
-                # 去掉每行的 // 注释前缀和 --deprecated 标记
-                uncommented = []
-                for line in body.split("\n"):
-                    line = re.sub(r"^//\s*", "", line)
-                    line = re.sub(r"\s*//\s*--deprecated\s*$", "", line)
-                    uncommented.append(line)
-                merged[name] = "\n".join(uncommented)
-            else:
-                merged[name] = body  # 本来就是活跃的，保留原有
-        else:
-            merged[name] = body
+        if name in deprecated_names:
+            body = _uncomment(body)
+        if name in it_handlers and name in deprecated_names:
+            restored_count += 1
+        merged[name] = body
 
     for name, body in it_handlers.items():
         if name not in merged:
@@ -223,6 +216,17 @@ def _extract_func_block(content: str, name: str, storage: dict, deprecated: bool
 def _extract_deprecated_names(content: str) -> set:
     """提取文件中所有废弃函数名。"""
     return set(re.findall(r'//\s*extern\s+"C"\s+void\s+(\w+)\s*\(', content))
+
+
+def _uncomment(body: str) -> str:
+    """去掉代码块每行的 // 注释前缀和 --deprecated 标记，保留用户手写修改。
+    只删 // 和紧跟的一个空格，保留原有的代码缩进。"""
+    lines = []
+    for line in body.split("\n"):
+        line = re.sub(r"^//\s?", "", line)
+        line = re.sub(r"\s*//\s*--deprecated\s*$", "", line)
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def create_ino(folder: Path, main_path: Path, msp_path: Path, has_it: bool = False):
@@ -370,13 +374,11 @@ def run_process(folder_path):
     has_it = False
     if it_c:
         it_handlers = extract_peripheral_handlers(it_c)
-        if it_handlers:
+        # 无条件调用：即使 it.c 中没有外设中断，也要把 ArduinoIT.h 中
+        # 已不存在的函数注释掉（it_handlers 为空 dict 表示全部移除）
+        if it_handlers or (folder / "ArduinoIT.h").exists():
             create_arduino_it(folder, it_handlers)
             has_it = True
-        else:
-            # 即使 it.c 中没有外设中断，ArduinoIT.h 可能已有历史函数，仍需 include
-            if (folder / "ArduinoIT.h").exists():
-                has_it = True
 
     create_ino(folder, main_c, msp_c, has_it)
 
